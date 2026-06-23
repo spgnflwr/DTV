@@ -313,8 +313,17 @@ tr:hover td{background:var(--sf2)}
       showSyncStatus('loading');
       const data = await window.dbLoad();
       if(data){
-        // localStorage에도 동기화
-        try{ localStorage.setItem('utm6', JSON.stringify(data)); }catch(e){}
+        // Firestore 데이터를 S에 직접 반영 + localStorage 동기화
+        try{
+          S = data;
+          // S 필드 보정
+          if(!S.advs)S.advs={};if(!S.tx)S.tx={};
+          if(!S.gantt)S.gantt={};if(!S.done)S.done={};
+          if(!S.cl)S.cl={};if(!S.sg)S.sg={};if(!S.mm)S.mm={};
+          localStorage.setItem('utm6', JSON.stringify(S));
+          // UI 갱신
+          if(typeof rNav==='function') rNav();
+        }catch(e){ console.error('Data apply error:',e); }
       }
       window._storage = getStorage(app);
     window._fbReady = true;
@@ -345,8 +354,16 @@ tr:hover td{background:var(--sf2)}
         return true;
       }catch(e){ console.error('Delete error:', e); return false; }
     };
-      // ld() 재호출 - 최신 DB 데이터로 덮어씌우기
-      if(typeof ld === 'function') ld();
+      // Firestore 로드 완료 — S는 위에서 이미 반영됨
+      // beforeunload: 미저장 변경사항 즉시 Firestore 동기 저장
+      window.addEventListener('beforeunload', function(){
+        try{ localStorage.setItem('utm6', JSON.stringify(S)); }catch(e){}
+        if(window._dbSaveTimer){ clearTimeout(window._dbSaveTimer); }
+        // 동기 XMLHttpRequest로 즉시 저장 (Beacon API 대안)
+        if(window._fbReady && window.dbSave){
+          window.dbSave(S);
+        }
+      });
     });
   </script>
 </head>
@@ -553,7 +570,7 @@ function sv(){
   // Firestore 저장 (debounce - 1초 후)
   if(window._fbReady){
     clearTimeout(window._dbSaveTimer);
-    window._dbSaveTimer=setTimeout(()=>window.dbSave(S), 1000);
+    window._dbSaveTimer=setTimeout(()=>window.dbSave(S), 500);
   }
 }
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
@@ -1614,6 +1631,17 @@ function calcNetVal(gross,mup,formula){
   return isNaN(n)?'':Math.round(n).toLocaleString()+'원';
 }
 
+function updCreativePreview(key, url){
+  // 해당 key에 속한 미리보기 링크 실시간 갱신
+  var wrap=document.getElementById('creative-preview-'+key);
+  if(!wrap)return;
+  if(url&&url.trim()){
+    wrap.innerHTML='<a href="'+url.trim()+'" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:4px;margin-top:5px;font-size:10px;padding:3px 10px;border-radius:4px;border:1px solid #bfdbfe;background:#eff6ff;color:#2563eb;text-decoration:none">🔍 미리보기</a>';
+  } else {
+    wrap.innerHTML='';
+  }
+}
+
 function calcDays(s,e){
   if(!s||!e)return'';
   var d=Math.ceil((new Date(e)-new Date(s))/86400000)+1;
@@ -1750,7 +1778,7 @@ function rSettingGuide(con){
     var es=extraStyle||'';
     return '<input type="text" value="'+v.replace(/"/g,'&quot;')+'" placeholder="'+placeholder+'"'
       +' style="width:100%;font-size:11px;padding:5px 8px;border:1px solid #dde1e7;border-radius:4px;background:#fff;color:#1c1f26;'+es+'"'
-      +' oninput="saveClField(\''+key+'\',\''+clk+'\',this.value)'+( clk==='budget_gross'?';updNet(\''+key+'\')':'')+'">';
+      +' oninput="saveClField(\''+key+'\',\''+clk+'\',this.value)'+(clk==='budget_gross'?';updNet(\''+key+'\')':clk==='creative_url'?';updCreativePreview(\''+key+'\',this.value)':'')+'">';
   }
   function sel(key, clk, opts, val){
     var v=val!==undefined?val:(cf[clk]||'');
@@ -1774,7 +1802,7 @@ function rSettingGuide(con){
     var m=parseFloat(markupVal||0)/100;
     var net='—';
     if(!isNaN(g)&&g>0&&!isNaN(m)&&m>0&&m<1&&formulaVal){
-      var n=formulaVal==='산술식2'?g/(1+m):g/(1-m);
+      var n=formulaVal.indexOf('산술식2')>=0?g/(1+m):g*(1-m);
       net=Math.round(n).toLocaleString()+'원';
     }
     return '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:4px;padding:6px 10px">'
@@ -2014,7 +2042,8 @@ function rSettingGuide(con){
         +col('소재 사이즈', inp(ak,'creative_size','예: 1080x1080, 9:16',af.creative_size))
         +col('트래킹 픽셀', inp(ak,'tracking_pixel','픽셀 ID 또는 태그',af.tracking_pixel))
       );
-      h+=grid(1, col('소재 파일 링크/URL', inp(ak,'creative_url','Drive 링크 또는 소재 URL',af.creative_url)));
+      h+=grid(1, col('소재 파일 링크/URL', inp(ak,'creative_url','Drive 링크 또는 소재 URL',af.creative_url)
+        +'<div id="creative-preview-'+ak+'">'+(af.creative_url?'<a href="'+af.creative_url+'" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:4px;margin-top:5px;font-size:10px;padding:3px 10px;border-radius:4px;border:1px solid #bfdbfe;background:#eff6ff;color:#2563eb;text-decoration:none">🔍 미리보기</a>':'')+'</div>'));
       // CM360 트래커 URL (입력→저장→읽기전용+수정 토글)
       var ak_=clKey(camp.id,grp.id,ad.id);
       var aItem2=getClItem(ak_);var af2=aItem2.fields||{};
@@ -2352,7 +2381,7 @@ function rCampStatus(con){
           platform:platform,medium:medium,
           campName:camp.name||'(미완성)',device:cf.device||'',
           grpName:grp.name||'(미완성)',target:gf.audience_type||'',
-          adName:ad.name||'(미완성)',creativeType:af.creative_format||'',
+          adName:ad.name||'(미완성)',creativeType:af.creative_format||'',creativeUrl:af.creative_url||'',
           period:period,periodDays:periodDays,
           budgetGross:campGross,budgetNet:campNet,
           dailyGross:dailyGross,dailyNet:dailyNet,
@@ -2478,7 +2507,7 @@ function rCampStatus(con){
   h+=thS('이름','text-align:left;min-width:155px');
   h+=thS('타겟유형','min-width:75px');
   h+=thS('이름','text-align:left;min-width:155px');
-  h+=thS('형식','min-width:60px');
+  h+=thS('미리보기','min-width:75px;text-align:center');
   h+=thS('GROSS','min-width:90px');
   h+=thS('NET','min-width:90px');
   h+=thS('GROSS','min-width:80px');
@@ -2499,7 +2528,17 @@ function rCampStatus(con){
     h+=tdm(r.grpName);
     h+=tdc(r.target);
     h+=tdm(r.adName);
-    h+=tdc(r.creativeType);
+    // 미리보기 링크 셀
+    if(r.creativeUrl){
+      h+='<td style="padding:5px 8px;border-right:1px solid '+C.rowBd+';border-bottom:1px solid '+C.rowBd+';text-align:center;min-width:75px">'
+        +'<a href="'+r.creativeUrl+'" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:3px;font-size:10px;padding:3px 8px;border-radius:4px;border:1px solid #bfdbfe;background:#eff6ff;color:#2563eb;text-decoration:none">🔍 보기</a>'
+        +(r.creativeType?'<div style="font-size:9px;color:#94a3b8;margin-top:2px">'+r.creativeType+'</div>':'')
+        +'</td>';
+    } else {
+      h+='<td style="padding:5px 8px;border-right:1px solid '+C.rowBd+';border-bottom:1px solid '+C.rowBd+';text-align:center;min-width:75px">'
+        +(r.creativeType?'<span style="font-size:10px;color:#64748b">'+r.creativeType+'</span>':'<span style="color:#cbd5e1;font-size:10px">—</span>')
+        +'</td>';
+    }
     // 기간
     if(r.period){
       h+='<td style="padding:7px 11px;border-right:1px solid '+C.rowBd+';border-bottom:1px solid '+C.rowBd+';min-width:170px">'
