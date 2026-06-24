@@ -3445,7 +3445,14 @@ function mmKey(){ return cAdv+'__'+cProj; }
 function getMMData(){
   if(!cAdv||!cProj)return null;
   var k=mmKey();
+  if(!S.mm)S.mm={};
   if(!S.mm[k])S.mm[k]={mixes:[],activeMixId:''};
+  var d=S.mm[k];
+  // mixes가 없거나 배열이 아니면 초기화
+  if(!d.mixes||!Array.isArray(d.mixes)){
+    d.mixes=[];
+    d.activeMixId='';
+  }
   // 기존 데이터 마이그레이션 (rows/brief/budget → 첫 번째 믹스)
   var d=S.mm[k];
   if(!d.mixes){
