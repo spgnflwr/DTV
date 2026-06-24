@@ -379,13 +379,39 @@ tr:hover td{background:var(--sf2)}
       window._storage = getStorage(app);
       window._fbReady = true;
 
-      // ── 실시간 동기화: 다른 사용자 변경 감지 → 토스트만 표시 ──
+      // ── 실시간 동기화: 경로 단위 반영 ──
       var _rtdbInitDone = false;
       onValue(ref(rtdb, 'data'), function(snap){
         if(!_rtdbInitDone){ _rtdbInitDone=true; return; }
         if(!snap.exists()) return;
+        // 내가 저장 중이면 무시 (debounce 타이머 있을 때)
         if(window._dbSaveTimer) return;
-        if(typeof showSyncToast==='function') showSyncToast();
+        try{
+          var newData = snap.val();
+          if(!newData) return;
+          // mm — 내가 수정 중인 믹스 행은 건드리지 않음
+          // 모달 열려있으면 mm 갱신 스킵
+          var mmModalOpen = document.getElementById('mm-row-modal') &&
+            document.getElementById('mm-row-modal').style.display==='flex';
+          if(newData.mm && !mmModalOpen){
+            S.mm = newData.mm;
+            if(cTab==='mm'){
+              var con=document.getElementById('mm-pane');
+              if(con) rMediaMix(con);
+            }
+          }
+          // advs/gantt/done
+          if(newData.advs) S.advs = newData.advs;
+          if(newData.gantt) S.gantt = newData.gantt;
+          if(newData.done) S.done = newData.done;
+          // cl/sg — 내가 입력 중인 필드 보호: focus된 input이 cl/sg 관련이면 스킵
+          var activeEl = document.activeElement;
+          var isClFocused = activeEl && (activeEl.closest && activeEl.closest('[data-clkey]'));
+          if(newData.cl && !isClFocused) S.cl = newData.cl;
+          if(newData.sg && !isClFocused) S.sg = newData.sg;
+          try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+          rNav();
+        }catch(e){ console.error('onValue apply error:',e); }
       });
 
     // ── Firebase Storage 파일 업로드 ──
@@ -684,30 +710,57 @@ async function runRowIdMigration(){
   }
 }
 
-function sv(){
+// 변경 경로 추적
+var _pendingPaths = {};
+
+function sv(paths){
   try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
   if(window._fbReady){
     clearTimeout(window._dbSaveTimer);
+    if(paths) paths.forEach(function(p){ _pendingPaths[p]=true; });
+    else _pendingPaths['data/advs']=_pendingPaths['data/tx']=_pendingPaths['data/gantt']=_pendingPaths['data/done']=true;
     window._dbSaveTimer=setTimeout(svMerge, 500);
   }
+}
+
+// mm 전용 저장 — 믹스/행 단위 경로로 update
+function svMm(projKey, mixId, rowId){
+  try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+  if(!window._fbReady) return;
+  clearTimeout(window._dbSaveTimer);
+  var path;
+  if(rowId) path='data/mm/'+projKey+'/mixes';  // rows는 배열이라 믹스 단위
+  else if(mixId) path='data/mm/'+projKey+'/mixes';
+  else path='data/mm/'+projKey;
+  _pendingPaths[path]=true;
+  // 믹스 메타 (activeMixId, showList)도 함께
+  _pendingPaths['data/mm/'+projKey+'/activeMixId']=true;
+  _pendingPaths['data/mm/'+projKey+'/showList']=true;
+  window._dbSaveTimer=setTimeout(svMerge, 500);
 }
 
 // ── 병합 저장 (Realtime DB update 방식) ──
 async function svMerge(){
   if(!window._fbReady||!window.dbUpdate) return;
+  var paths = Object.keys(_pendingPaths);
+  _pendingPaths = {};
+  if(!paths.length) return;
   try{
-    // mm, advs, tx, gantt, done 경로 단위 update
     var updates = {};
-    updates['data/advs'] = S.advs||{};
-    updates['data/tx'] = S.tx||{};
-    updates['data/gantt'] = S.gantt||{};
-    updates['data/done'] = S.done||{};
-    updates['data/mm'] = S.mm||{};
+    paths.forEach(function(path){
+      // path에서 값 추출
+      var parts = path.replace('data/','').split('/');
+      var val = S;
+      for(var i=0;i<parts.length;i++){
+        if(val===undefined||val===null){val=null;break;}
+        val=val[parts[i]];
+      }
+      updates[path] = val !== undefined ? val : null;
+    });
     if(S._rowIdMigrated) updates['data/_rowIdMigrated'] = true;
     await window.dbUpdate(updates);
   } catch(e){
     console.error('svMerge error:', e);
-    // 실패 시 전체 저장
     if(window.dbSave) await window.dbSave(S);
   }
 }
@@ -3484,7 +3537,7 @@ function createMix(name){
   var n=name||(d.mixes.length+1)+'번째 미디어믹스';
   d.mixes.push({id:id,name:n,createdAt:new Date().toISOString().slice(0,10),rows:[],brief:{text:'',files:[]},budget:{total:'',items:[]},mmTab:'brief'});
   d.activeMixId=id;
-  sv();
+  svMm(mmKey());
   var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
 }
 
@@ -3494,21 +3547,21 @@ function deleteMix(id){
   d.mixes=d.mixes.filter(function(m){return m.id!==id;});
   if(d.activeMixId===id)d.activeMixId=d.mixes[0].id;
   d.showList=true;
-  sv();
+  svMm(mmKey());
   var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
 }
 
 function setActiveMix(id){
   var d=getMMData();if(!d)return;
   d.activeMixId=id;
-  sv();
+  svMm(mmKey());
   var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
 }
 
 function renameMix(id,name){
   var d=getMMData();if(!d)return;
   var mix=d.mixes.find(function(m){return m.id===id;});
-  if(mix){mix.name=name;sv();}
+  if(mix){mix.name=name;svMm(mmKey());}
 }
 
 function cloneMix(id){
@@ -3736,7 +3789,7 @@ function addMMRow(seg){
 
 function delMMRow(idx){
   var d=getActiveMix();
-  d.rows.splice(idx,1); sv();
+  d.rows.splice(idx,1); svMm(mmKey());
   var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
 }
 
@@ -3818,7 +3871,7 @@ function rMediaMix(con){
 function setMMTab(tab){
   var mix=getActiveMix();
   mix.mmTab=tab;
-  sv();
+  svMm(mmKey());
   var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
 }
 
@@ -5123,7 +5176,7 @@ function mmModalSave(){
     var ob=segOrder[b.seg]!=null?segOrder[b.seg]:99;
     return oa-ob;
   });
-  sv();
+  svMm(mmKey());
   cm('mm-row-modal');
   var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
 }
@@ -5164,7 +5217,7 @@ function confirmMixName(){
       d.mixes.push(newMix);
       d.activeMixId=newMix.id;
       d.showList=false;
-      sv();
+      svMm(mmKey());
       var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
     }
     window._mixCloneId=null;
@@ -5269,7 +5322,7 @@ function deleteMixData(btn){
 function goMMList(){
   var d=getMMData();if(!d)return;
   d.showList=true;
-  sv();
+  svMm(mmKey());
   var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
 }
 
