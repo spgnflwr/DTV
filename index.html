@@ -379,29 +379,13 @@ tr:hover td{background:var(--sf2)}
       window._storage = getStorage(app);
       window._fbReady = true;
 
-      // ── 실시간 동기화: 다른 사용자 변경 감지 + 직접 반영 ──
+      // ── 실시간 동기화: 다른 사용자 변경 감지 → 토스트만 표시 ──
       var _rtdbInitDone = false;
       onValue(ref(rtdb, 'data'), function(snap){
-        if(!_rtdbInitDone){ _rtdbInitDone=true; return; } // 초기 1회 skip
+        if(!_rtdbInitDone){ _rtdbInitDone=true; return; }
         if(!snap.exists()) return;
-        // 내가 저장 중이면 무시
         if(window._dbSaveTimer) return;
-        // 데이터 직접 반영
-        try{
-          var newData = snap.val();
-          if(!newData) return;
-          // mm만 교체 (내가 작업 중인 cl/sg 보호)
-          if(newData.mm) S.mm = newData.mm;
-          if(newData.advs) S.advs = newData.advs;
-          if(newData.gantt) S.gantt = newData.gantt;
-          if(newData.done) S.done = newData.done;
-          try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
-          // 현재 탭 UI 갱신
-          if(cTab==='mm'){var con=document.getElementById('mm-pane');if(con)rMediaMix(con);}
-          if(typeof rNav==='function') rNav();
-          // 알림은 토스트로
-          if(typeof showSyncToast==='function') showSyncToast('업데이트');
-        }catch(e){ console.error('onValue apply error:',e); }
+        if(typeof showSyncToast==='function') showSyncToast();
       });
 
     // ── Firebase Storage 파일 업로드 ──
