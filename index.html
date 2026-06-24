@@ -255,7 +255,7 @@ tr:hover td{background:var(--sf2)}
   <!-- Firebase SDK (CDN) v12.14.0 -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
-    import { getFirestore, doc, setDoc, getDoc }
+    import { getFirestore, doc, setDoc, getDoc, onSnapshot }
       from "https://www.gstatic.com/firebasejs/12.14.0/firebase-firestore.js";
     import { getStorage, ref, uploadBytesResumable, getDownloadURL, deleteObject, listAll }
       from "https://www.gstatic.com/firebasejs/12.14.0/firebase-storage.js";
@@ -285,10 +285,40 @@ tr:hover td{background:var(--sf2)}
       try{
         await setDoc(doc(db,'store','main'), { payload: JSON.stringify(data) });
         showSyncStatus('saved');
+        // 자동 백업 (5분에 1번)
+        var now = Date.now();
+        if(!window._lastBackupAt || now - window._lastBackupAt > 5*60*1000){
+          window._lastBackupAt = now;
+          var backupKey = 'backup_' + new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+          try{
+            await setDoc(doc(db,'backups', backupKey), { payload: JSON.stringify(data), savedAt: now });
+            // 20개 초과 백업은 정리 (별도 함수)
+            window._cleanOldBackups && window._cleanOldBackups();
+          }catch(be){ console.warn('Backup failed:', be); }
+        }
       } catch(e){
         console.error('DB save error:', e);
         showSyncStatus('error');
       }
+    };
+
+    // 백업 목록 불러오기
+    window.dbLoadBackups = async function(){
+      try{
+        const {getDocs, collection, orderBy, query, limit} = await import('https://www.gstatic.com/firebasejs/12.14.0/firebase-firestore.js');
+        const q = query(collection(db,'backups'), orderBy('savedAt','desc'), limit(20));
+        const snap = await getDocs(q);
+        return snap.docs.map(function(d){ return {id:d.id, savedAt:d.data().savedAt}; });
+      }catch(e){ console.error('loadBackups error:',e); return []; }
+    };
+
+    // 백업 복원
+    window.dbRestoreBackup = async function(backupId){
+      try{
+        const snap = await getDoc(doc(db,'backups',backupId));
+        if(!snap.exists()) return null;
+        return JSON.parse(snap.data().payload);
+      }catch(e){ console.error('restore error:',e); return null; }
     };
 
     // DB 불러오기
@@ -318,15 +348,35 @@ tr:hover td{background:var(--sf2)}
           S = data;
           // S 필드 보정
           if(!S.advs)S.advs={};if(!S.tx)S.tx={};
+          // 택소노미 기본값 보정 (없는 키만 채움)
+          if(typeof TXM!=='undefined'&&typeof TXD!=='undefined'){
+            TXM.forEach(function(m){if(!S.tx[m.k])S.tx[m.k]=JSON.parse(JSON.stringify(TXD[m.k]));});
+          }
           if(!S.gantt)S.gantt={};if(!S.done)S.done={};
           if(!S.cl)S.cl={};if(!S.sg)S.sg={};if(!S.mm)S.mm={};
           localStorage.setItem('utm6', JSON.stringify(S));
           // UI 갱신
+          // 기존 rows에 _id 없으면 자동 부여 (마이그레이션)
+          migrateRowIds(S);
           if(typeof rNav==='function') rNav();
-        }catch(e){ console.error('Data apply error:',e); }
+        }catch(e){ console.error('Data apply error:',e); if(typeof ld==='function') ld(); }
+      } else {
+        // Firestore에 데이터 없음 → localStorage/SEED fallback
+        if(typeof ld==='function') ld();
       }
       window._storage = getStorage(app);
-    window._fbReady = true;
+      window._fbReady = true;
+
+      // ── 실시간 동기화: 다른 사용자 변경 감지 ──
+      var _snapshotInit = true; // 최초 로드는 무시
+      onSnapshot(doc(db,'store','main'), function(snap){
+        if(_snapshotInit){ _snapshotInit=false; return; } // 초기 1회 skip
+        if(!snap.exists()) return;
+        // 내가 저장 중이면 무시 (500ms 이내)
+        if(window._dbSaveTimer) return;
+        // 토스트 알림만 표시 (덮어쓰기 안 함)
+        if(typeof showSyncToast === 'function') showSyncToast();
+      });
 
     // ── Firebase Storage 파일 업로드 ──
     window.uploadFile = async function(file, path, onProgress){
@@ -494,6 +544,12 @@ tr:hover td{background:var(--sf2)}
         <div style="font-size:11px;color:#4a5264;margin-bottom:10px">현재 모든 데이터를 JSON 파일로 저장합니다. 정기적으로 백업해두세요.</div>
         <button onclick="exportJSON()" style="font-size:12px;padding:7px 16px;border-radius:6px;border:none;background:#15803d;color:#fff;cursor:pointer;font-weight:500">💾 JSON 파일로 내보내기</button>
       </div>
+      <!-- 클라우드 백업 복원 -->
+      <div style="background:#fdf4ff;border:1px solid #e9d5ff;border-radius:8px;padding:14px;margin-bottom:12px">
+        <div style="font-size:12px;font-weight:700;color:#7c3aed;margin-bottom:6px">☁️ 클라우드 자동 백업 복원</div>
+        <div style="font-size:11px;color:#4a5264;margin-bottom:10px">5분마다 자동 저장된 백업에서 이전 시점으로 복원합니다. 최근 20개 보관.</div>
+        <button onclick="showBackupList()" style="font-size:12px;padding:7px 16px;border-radius:6px;border:none;background:#7c3aed;color:#fff;cursor:pointer;font-weight:500">🗂 백업 목록 보기</button>
+      </div>
       <!-- 불러오기 -->
       <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:14px;margin-bottom:12px">
         <div style="font-size:12px;font-weight:700;color:#1d4ed8;margin-bottom:6px">📥 데이터 불러오기 (JSON 복원)</div>
@@ -565,13 +621,217 @@ function ld(){
   if(!S.mm)S.mm={};
   rNav();
 }
+function migrateRowIds(state){
+  if(!state||!state.mm) return;
+  Object.keys(state.mm).forEach(function(k){
+    var d=state.mm[k];
+    if(!d||!d.mixes) return;
+    d.mixes.forEach(function(mix){
+      if(!mix.rows) return;
+      mix.rows.forEach(function(r){
+        if(!r._id){ r._id=uid(); r._updatedAt=Date.now(); }
+      });
+    });
+  });
+}
+
 function sv(){
   try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
-  // Firestore 저장 (debounce - 1초 후)
   if(window._fbReady){
     clearTimeout(window._dbSaveTimer);
-    window._dbSaveTimer=setTimeout(()=>window.dbSave(S), 500);
+    window._dbSaveTimer=setTimeout(svMerge, 500);
   }
+}
+
+// ── 병합 저장 ──
+async function svMerge(){
+  if(!window._fbReady||!window.dbLoad||!window.dbSave) return;
+  try{
+    var remote = await window.dbLoad();
+    if(!remote){
+      // Firestore에 데이터 없으면 그냥 저장
+      await window.dbSave(S);
+      return;
+    }
+    var merged = mergeState(remote, S);
+    // 충돌 행 있으면 사용자에게 물어봄
+    if(merged._conflicts && merged._conflicts.length > 0){
+      showConflictUI(merged._conflicts, merged);
+      return;
+    }
+    delete merged._conflicts;
+    S = merged;
+    try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+    await window.dbSave(S);
+  } catch(e){
+    console.error('svMerge error:', e);
+    // 실패 시 기존 방식으로 저장
+    await window.dbSave(S);
+  }
+}
+
+// ── 상태 병합 함수 ──
+function mergeState(remote, local){
+  var merged = JSON.parse(JSON.stringify(remote)); // remote 기반
+  var conflicts = [];
+
+  // 1. 택소노미 — 로컬 우선 (키 단위 병합)
+  if(local.tx){
+    if(!merged.tx) merged.tx={};
+    Object.keys(local.tx).forEach(function(k){
+      merged.tx[k] = local.tx[k];
+    });
+  }
+
+  // 2. 세팅 체크리스트 — 키(캠페인ID) 단위 병합, 로컬 우선
+  if(local.cl){
+    if(!merged.cl) merged.cl={};
+    Object.keys(local.cl).forEach(function(k){
+      merged.cl[k] = local.cl[k];
+    });
+  }
+
+  // 3. 세팅 가이드 — 키 단위 병합, 로컬 우선
+  if(local.sg){
+    if(!merged.sg) merged.sg={};
+    Object.keys(local.sg).forEach(function(k){
+      merged.sg[k] = local.sg[k];
+    });
+  }
+
+  // 4. 간트 — 키 단위 병합, 로컬 우선
+  if(local.gantt){
+    if(!merged.gantt) merged.gantt={};
+    Object.keys(local.gantt).forEach(function(k){
+      merged.gantt[k] = local.gantt[k];
+    });
+  }
+
+  // 5. 광고주/캠페인 구조 — 로컬 우선
+  if(local.advs) merged.advs = local.advs;
+  if(local.done) merged.done = local.done;
+
+  // 6. 미디어믹스 — 로컬 완전 우선 + remote에만 있는 신규 믹스만 추가
+  if(local.mm){
+    if(!merged.mm) merged.mm={};
+    Object.keys(local.mm).forEach(function(projKey){
+      var localMM = local.mm[projKey];
+      var remoteMM = merged.mm[projKey];
+      if(!remoteMM){
+        merged.mm[projKey] = localMM;
+        return;
+      }
+      // 로컬 기준으로 시작
+      var mergedMM = JSON.parse(JSON.stringify(localMM));
+
+      // remote에만 있는 믹스(다른 사람이 새로 만든 것)만 추가
+      var localMixIds = (localMM.mixes||[]).map(function(m){return m.id;});
+      (remoteMM.mixes||[]).forEach(function(rMix){
+        if(localMixIds.indexOf(rMix.id) === -1){
+          // 로컬에 없는 믹스 → 다른 사람이 만든 것, 추가
+          mergedMM.mixes.push(rMix);
+        }
+      });
+
+      merged.mm[projKey] = mergedMM;
+    });
+  }
+
+  merged._conflicts = conflicts;
+  return merged;
+}
+
+// ── 충돌 UI ──
+function showConflictUI(conflicts, mergedState){
+  var existing = document.getElementById('conflict-modal');
+  if(existing) existing.remove();
+
+  var modal = document.createElement('div');
+  modal.id = 'conflict-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99999;display:flex;align-items:center;justify-content:center';
+
+  var h = '<div style="background:#fff;border-radius:12px;width:600px;max-width:95vw;max-height:85vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.3)">';
+  h += '<div style="padding:16px 20px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:8px">';
+  h += '<span style="font-size:18px">⚠️</span><span style="font-size:14px;font-weight:700;color:#dc2626">저장 충돌 발생</span>';
+  h += '<span style="font-size:11px;color:#64748b;margin-left:4px">— 다른 사용자가 같은 행을 수정했습니다</span>';
+  h += '</div>';
+  h += '<div style="padding:16px 20px">';
+
+  conflicts.forEach(function(c, ci){
+    h += '<div style="margin-bottom:16px;border:1px solid #fecaca;border-radius:8px;overflow:hidden">';
+    h += '<div style="padding:8px 12px;background:#fef2f2;font-size:11px;font-weight:700;color:#dc2626">충돌 '+(ci+1)+': '+c.mixName+' — '+(c.local.campaign||'')+'/'+(c.local.adgroup||'')+'</div>';
+    h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0">';
+    // 내 버전
+    h += '<div style="padding:10px 12px;border-right:1px solid #fee2e2">';
+    h += '<div style="font-size:10px;font-weight:700;color:#2563eb;margin-bottom:6px">📝 내 버전 ('+(c.local._updatedAt?new Date(c.local._updatedAt).toLocaleTimeString():'?')+')</div>';
+    h += '<div style="font-size:10px;color:#334155">예산: '+(c.local.budget||'—')+'<br>CPM: '+(c.local.cpm||'—')+'<br>CTR: '+(c.local.ctr||'—')+'%</div>';
+    h += '<button data-ci="'+ci+'" data-choice="local" onclick="resolveConflict(+this.dataset.ci,this.dataset.choice)" style="margin-top:8px;width:100%;font-size:11px;padding:5px;border-radius:4px;border:1px solid #2563eb;background:#eff6ff;color:#2563eb;cursor:pointer">내 버전 사용</button>';
+    h += '</div>';
+    // 상대 버전
+    h += '<div style="padding:10px 12px">';
+    h += '<div style="font-size:10px;font-weight:700;color:#dc2626;margin-bottom:6px">👥 상대 버전 ('+(c.remote._updatedAt?new Date(c.remote._updatedAt).toLocaleTimeString():'?')+')</div>';
+    h += '<div style="font-size:10px;color:#334155">예산: '+(c.remote.budget||'—')+'<br>CPM: '+(c.remote.cpm||'—')+'<br>CTR: '+(c.remote.ctr||'—')+'%</div>';
+    h += '<button data-ci="'+ci+'" data-choice="remote" onclick="resolveConflict(+this.dataset.ci,this.dataset.choice)" style="margin-top:8px;width:100%;font-size:11px;padding:5px;border-radius:4px;border:1px solid #dc2626;background:#fef2f2;color:#dc2626;cursor:pointer">상대 버전 사용</button>';
+    h += '</div>';
+    h += '</div></div>';
+  });
+
+  h += '</div>';
+  h += '<div style="padding:12px 20px;border-top:1px solid #e2e8f0;display:flex;justify-content:flex-end;gap:8px">';
+  h += '<button data-choice="local" onclick="resolveAllConflicts(this.dataset.choice)" style="font-size:11px;padding:7px 14px;border-radius:6px;border:1px solid #2563eb;background:#eff6ff;color:#2563eb;cursor:pointer">전체 내 버전</button>';
+  h += '<button data-choice="remote" onclick="resolveAllConflicts(this.dataset.choice)" style="font-size:11px;padding:7px 14px;border-radius:6px;border:1px solid #dc2626;background:#fef2f2;color:#dc2626;cursor:pointer">전체 상대 버전</button>';
+  h += '</div>';
+  h += '</div>';
+
+  modal.innerHTML = h;
+  document.body.appendChild(modal);
+
+  // 충돌 데이터 임시 보관
+  window._conflictData = {conflicts: conflicts, mergedState: mergedState};
+}
+
+function resolveConflict(ci, choice){
+  if(!window._conflictData) return;
+  var c = window._conflictData.conflicts[ci];
+  var merged = window._conflictData.mergedState;
+  // 해당 믹스 찾아서 행 교체
+  Object.keys(merged.mm||{}).forEach(function(projKey){
+    (merged.mm[projKey].mixes||[]).forEach(function(mix){
+      if(mix.id === c.mixId){
+        var rowIdx = mix.rows.findIndex(function(r){return r._id===c.local._id;});
+        if(rowIdx>=0) mix.rows[rowIdx] = choice==='local' ? c.local : c.remote;
+      }
+    });
+  });
+  c._resolved = choice;
+  // 모두 해결됐으면 저장
+  var allDone = window._conflictData.conflicts.every(function(cf){return cf._resolved;});
+  if(allDone) finishConflictSave();
+  else {
+    // 해당 충돌 카드 비활성화
+    var btns = document.querySelectorAll('#conflict-modal button');
+    document.getElementById('conflict-modal').querySelectorAll('[onclick*="resolveConflict('+ci+'"]').forEach(function(b){
+      b.style.opacity='0.4';b.disabled=true;
+    });
+  }
+}
+
+function resolveAllConflicts(choice){
+  if(!window._conflictData) return;
+  window._conflictData.conflicts.forEach(function(c,ci){ resolveConflict(ci, choice); });
+}
+
+async function finishConflictSave(){
+  var merged = window._conflictData.mergedState;
+  delete merged._conflicts;
+  S = merged;
+  try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+  await window.dbSave(S);
+  var modal = document.getElementById('conflict-modal');
+  if(modal) modal.remove();
+  window._conflictData = null;
+  var con = document.getElementById('mm-pane');
+  if(con) rMediaMix(con);
 }
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
 function gv(id){const e=document.getElementById(id);return e?e.value.trim():'';}
@@ -3148,6 +3408,22 @@ function renameMix(id,name){
   if(mix){mix.name=name;sv();}
 }
 
+function cloneMix(id){
+  var d=getMMData();if(!d)return;
+  var src=d.mixes.find(function(m){return m.id===id;});
+  if(!src){alert('믹스를 찾을 수 없습니다.');return;}
+  // mix-name-modal 재활용
+  var modal=document.getElementById('mix-name-modal');
+  var inp=document.getElementById('mix-name-inp');
+  var title=document.getElementById('mix-name-modal-title');
+  if(inp) inp.value=src.name+' (복사본)';
+  if(title) title.textContent='⧉ 믹스 복제';
+  window._mixRenameId=null;
+  window._mixCloneId=id; // 복제 대상 id 보관
+  if(modal) modal.style.display='flex';
+  setTimeout(function(){if(inp){inp.focus();inp.select();}},100);
+}
+
 var MM_SEGS_DEFAULT=['Awareness','Engagement','Conversion'];
 var MM_SEGS=['Awareness','Engagement','Conversion'];
 
@@ -3268,7 +3544,7 @@ function subTotRow(seg,st){
       +';font-size:10px;font-weight:700;color:'+sc.color+'">'+v+'</td>';
   }
   return '<tr style="background:'+sc.light+'">'
-    +'<td colspan="8" style="padding:5px 12px;border-right:1px solid '+C.bd+';border-bottom:2px solid '+sc.border
+    +'<td colspan="6" style="padding:5px 12px;border-right:1px solid '+C.bd+';border-bottom:2px solid '+sc.border
     +';background:'+sc.light+';font-size:11px;font-weight:700;color:'+sc.color+'">'+seg+' 소계 ('+st.cnt+'개)</td>'
     +stc(st.budget?st.budget.toLocaleString()+'원':'—')
     +stc(k.cpm?k.cpm.toLocaleString():'—')
@@ -3290,7 +3566,7 @@ function grandRow(gt){
       +';background:'+C.hd2+';font-size:10px;font-weight:700;color:'+C.hdTxt+'">'+v+'</td>';
   }
   return '<tr style="background:'+C.hd2+'">'
-    +'<td colspan="8" style="padding:6px 12px;border-right:1px solid '+C.hdBd+';background:'+C.hd2
+    +'<td colspan="6" style="padding:6px 12px;border-right:1px solid '+C.hdBd+';background:'+C.hd2
     +';font-size:11px;font-weight:700;color:'+C.hdTxt+'">▶ 전체 합계</td>'
     +gtc(gt.budget?gt.budget.toLocaleString()+'원':'—')
     +gtc(k.cpm?k.cpm.toLocaleString():'—')
@@ -3394,10 +3670,14 @@ function rMediaMix(con){
     h+='<span data-mid="'+m.id+'" onclick="setActiveMix(\''+m.id+'\')" '
       +'ondblclick="startRenameMix(\''+m.id+'\',this)" '
       +'style="font-size:11px;font-weight:'+(isActive?'600':'400')+';color:'+(isActive?'#fff':'var(--tx2)')+'">'+m.name+'</span>';
-    // 삭제 버튼 (활성 믹스에만)
-    if(isActive&&d.mixes.length>1){
-      h+='<button data-mid="'+m.id+'" onclick="deleteMix(\''+m.id+'\')" '
-        +'style="border:none;background:transparent;cursor:pointer;color:#bfdbfe;font-size:12px;padding:0;line-height:1;margin-left:2px">×</button>';
+    // 복제·삭제 버튼 (활성 믹스에만)
+    if(isActive){
+      h+='<button data-mid="'+m.id+'" onclick="cloneMix(\''+m.id+'\')" title="이 믹스 복제" '
+        +'style="border:none;background:transparent;cursor:pointer;color:#bfdbfe;font-size:11px;padding:0;line-height:1;margin-left:4px" title="복제">⧉</button>';
+      if(d.mixes.length>1){
+        h+='<button data-mid="'+m.id+'" onclick="deleteMix(\''+m.id+'\')" '
+          +'style="border:none;background:transparent;cursor:pointer;color:#bfdbfe;font-size:12px;padding:0;line-height:1;margin-left:2px">×</button>';
+      }
     }
     h+='</div>';
   });
@@ -4181,6 +4461,72 @@ function showSyncStatus(state){
   }
 }
 
+function showSyncToast(){
+  var t=document.getElementById('sync-toast');
+  if(!t){
+    t=document.createElement('div');
+    t.id='sync-toast';
+    t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:99999;background:#1e293b;color:#fff;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.25);display:flex;align-items:center;gap:10px;padding:12px 18px;font-size:12px;min-width:280px';
+    document.body.appendChild(t);
+  }
+  t.innerHTML='<span style="font-size:16px">🔔</span>'
+    +'<span style="flex:1"><b>다른 사용자가 데이터를 업데이트했습니다</b><br><span style="font-size:11px;opacity:.7">새로고침하면 최신 데이터를 불러옵니다</span></span>'
+    +'<button onclick="location.reload()" style="font-size:11px;padding:5px 12px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;white-space:nowrap;flex-shrink:0">새로고침</button>'
+    +'<button onclick="this.parentNode.style.display=\'none\'" style="font-size:14px;padding:2px 6px;border-radius:4px;border:none;background:transparent;color:#94a3b8;cursor:pointer;flex-shrink:0">✕</button>';
+  t.style.display='flex';
+}
+
+async function showBackupList(){
+  var modal=document.getElementById('backup-modal');
+  if(!modal){
+    modal=document.createElement('div');
+    modal.id='backup-modal';
+    modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99999;display:flex;align-items:center;justify-content:center';
+    document.body.appendChild(modal);
+  }
+  modal.innerHTML='<div style="background:#fff;border-radius:12px;width:480px;max-width:95vw;box-shadow:0 20px 60px rgba(0,0,0,.3)">'
+    +'<div style="padding:16px 20px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between">'
+    +'<span style="font-size:14px;font-weight:700">🗂 백업 복원</span>'
+    +'<button onclick="document.getElementById(\'backup-modal\').remove()" style="border:none;background:transparent;cursor:pointer;font-size:18px;color:#94a3b8">✕</button>'
+    +'</div>'
+    +'<div id="backup-list-body" style="padding:16px 20px;max-height:400px;overflow-y:auto">'
+    +'<div style="text-align:center;color:#94a3b8;font-size:12px;padding:20px">불러오는 중...</div>'
+    +'</div></div>';
+  modal.style.display='flex';
+
+  var backups = await (window.dbLoadBackups ? window.dbLoadBackups() : Promise.resolve([]));
+  var body = document.getElementById('backup-list-body');
+  if(!body) return;
+  if(!backups||!backups.length){
+    body.innerHTML='<div style="text-align:center;color:#94a3b8;font-size:12px;padding:20px">백업 없음</div>';
+    return;
+  }
+  var h='';
+  backups.forEach(function(b){
+    var dt=new Date(b.savedAt);
+    var label=dt.toLocaleDateString('ko-KR')+' '+dt.toLocaleTimeString('ko-KR');
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #f1f5f9">'
+      +'<span style="font-size:12px;color:#334155">'+label+'</span>'
+      +'<button data-bid="'+b.id+'" onclick="restoreBackup(this.dataset.bid)" '
+      +'style="font-size:11px;padding:4px 12px;border-radius:4px;border:1px solid #dc2626;background:#fef2f2;color:#dc2626;cursor:pointer">복원</button>'
+      +'</div>';
+  });
+  body.innerHTML=h;
+}
+
+async function restoreBackup(backupId){
+  if(!confirm('이 시점으로 복원하면 현재 데이터가 덮어씌워집니다. 계속할까요?')) return;
+  var data = await (window.dbRestoreBackup ? window.dbRestoreBackup(backupId) : null);
+  if(!data){alert('복원 실패');return;}
+  S = data;
+  try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+  await window.dbSave(S);
+  var modal=document.getElementById('backup-modal');
+  if(modal)modal.remove();
+  rNav();
+  alert('복원 완료');
+}
+
 // ── JSON 백업 / 복원 ──
 function exportJSON(){
   var fname='utm_backup_'+new Date().toISOString().slice(0,10)+'.json';
@@ -4640,6 +4986,14 @@ function mmModalSave(){
     cvr:gv('mm-modal-cvr'),
     target:'',
   };
+  // 신규 행이면 uid 부여, 수정이면 기존 id 유지
+  if(_mmEditIdx>=0 && d && getActiveMix().rows[_mmEditIdx] && getActiveMix().rows[_mmEditIdx]._id){
+    row._id = getActiveMix().rows[_mmEditIdx]._id;
+    row._updatedAt = Date.now();
+  } else {
+    row._id = uid();
+    row._updatedAt = Date.now();
+  }
   // 광고그룹 수집
   mmModalSaveGroups();
   row.adgroups=_mmModalGroups.filter(function(g){return (g.name&&g.name.trim())||g.targets.some(function(t){return t&&t.trim();});}).map(function(g){
@@ -4650,8 +5004,13 @@ function mmModalSave(){
 
   var d=getActiveMix();
   if(_mmEditIdx>=0){
+    // 기존 id 유지
+    if(d.rows[_mmEditIdx]&&d.rows[_mmEditIdx]._id) row._id=d.rows[_mmEditIdx]._id;
+    row._updatedAt=Date.now();
     d.rows[_mmEditIdx]=row;
   } else {
+    if(!row._id) row._id=uid();
+    row._updatedAt=Date.now();
     d.rows.push(row);
   }
   // 세그먼트 순서 정렬
@@ -4690,7 +5049,23 @@ function confirmMixName(){
   var inp=document.getElementById('mix-name-inp');
   var name=(inp?inp.value:'').trim();
   if(!name)return;
-  if(window._mixRenameId){
+  if(window._mixCloneId){
+    // 복제
+    var d=getMMData();
+    var src=d&&d.mixes.find(function(m){return m.id===window._mixCloneId;});
+    if(src&&d){
+      var newMix=JSON.parse(JSON.stringify(src));
+      newMix.id='mix_'+Date.now();
+      newMix.name=name;
+      newMix.createdAt=new Date().toISOString().slice(0,10);
+      d.mixes.push(newMix);
+      d.activeMixId=newMix.id;
+      d.showList=false;
+      sv();
+      var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
+    }
+    window._mixCloneId=null;
+  } else if(window._mixRenameId){
     renameMix(window._mixRenameId, name);
     var con=document.getElementById('mm-pane');if(con)rMediaMix(con);
   } else {
@@ -4744,6 +5119,7 @@ function rMMList(con,d,adv,proj){
       h+='<div style="font-size:14px;font-weight:700;color:var(--tx);flex:1">'+m.name+'</div>';
       h+='<div style="display:flex;gap:4px">';
       h+='<button data-mid="'+m.id+'" data-name="'+m.name.replace(/"/g,'&quot;')+'" onclick="event.stopPropagation();showRenameMixData(this)" style="border:none;background:transparent;cursor:pointer;color:var(--tx3);font-size:13px;padding:2px 5px" title="이름 변경">✏️</button>';
+      h+='<button data-mid="'+m.id+'" onclick="event.stopPropagation();cloneMix(this.dataset.mid)" style="border:none;background:transparent;cursor:pointer;color:var(--tx3);font-size:13px;padding:2px 5px" title="복제">⧉</button>';
       h+='<button data-mid="'+m.id+'" onclick="event.stopPropagation();deleteMixData(this)" style="border:none;background:transparent;cursor:pointer;color:var(--tx3);font-size:13px;padding:2px 5px" title="삭제">🗑</button>';
       h+='</div>';
       h+='</div>';
