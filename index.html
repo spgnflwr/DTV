@@ -255,9 +255,9 @@ tr:hover td{background:var(--sf2)}
   <!-- Firebase SDK (CDN) v12.14.0 -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
-    import { getFirestore, doc, setDoc, getDoc, onSnapshot }
-      from "https://www.gstatic.com/firebasejs/12.14.0/firebase-firestore.js";
-    import { getStorage, ref, uploadBytesResumable, getDownloadURL, deleteObject, listAll }
+    import { getDatabase, ref, set, get, update, onValue, push, remove }
+      from "https://www.gstatic.com/firebasejs/12.14.0/firebase-database.js";
+    import { getStorage, ref as sRef, uploadBytesResumable, getDownloadURL, deleteObject, listAll }
       from "https://www.gstatic.com/firebasejs/12.14.0/firebase-storage.js";
 
     const firebaseConfig = {
@@ -267,23 +267,20 @@ tr:hover td{background:var(--sf2)}
       storageBucket: "max-mngr-001.firebasestorage.app",
       messagingSenderId: "736571045769",
       appId: "1:736571045769:web:00cdf90e6d2fddcb999358",
-      measurementId: "G-74E4Y3FGBQ"
+      measurementId: "G-74E4Y3FGBQ",
+      databaseURL: "https://max-mngr-001-default-rtdb.asia-southeast1.firebasedatabase.app"
     };
 
     const app = initializeApp(firebaseConfig);
-    const db  = getFirestore(app);
-
-    // ── Firestore 키 구조 ──
-    // /store/main → 전체 S 객체를 하나의 문서로 저장 (단순 구조)
+    const rtdb = getDatabase(app);
 
     window._fbReady = false;
-    window._db = db;
-    window._fbDoc = { setDoc, getDoc, doc };
+    window._rtdb = rtdb;
 
-    // DB 저장
+    // ── 전체 저장 (S 전체를 /data 경로에)
     window.dbSave = async function(data){
       try{
-        await setDoc(doc(db,'store','main'), { payload: JSON.stringify(data) });
+        await set(ref(rtdb, 'data'), data);
         showSyncStatus('saved');
         // 자동 백업 (5분에 1번)
         var now = Date.now();
@@ -291,9 +288,7 @@ tr:hover td{background:var(--sf2)}
           window._lastBackupAt = now;
           var backupKey = 'backup_' + new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
           try{
-            await setDoc(doc(db,'backups', backupKey), { payload: JSON.stringify(data), savedAt: now });
-            // 20개 초과 백업은 정리 (별도 함수)
-            window._cleanOldBackups && window._cleanOldBackups();
+            await set(ref(rtdb, 'backups/' + backupKey), { payload: JSON.stringify(data), savedAt: now });
           }catch(be){ console.warn('Backup failed:', be); }
         }
       } catch(e){
@@ -302,33 +297,24 @@ tr:hover td{background:var(--sf2)}
       }
     };
 
-    // 백업 목록 불러오기
-    window.dbLoadBackups = async function(){
+    // ── 경로 단위 update (필드 단위 저장 핵심)
+    window.dbUpdate = async function(updates){
       try{
-        const {getDocs, collection, orderBy, query, limit} = await import('https://www.gstatic.com/firebasejs/12.14.0/firebase-firestore.js');
-        const q = query(collection(db,'backups'), orderBy('savedAt','desc'), limit(20));
-        const snap = await getDocs(q);
-        return snap.docs.map(function(d){ return {id:d.id, savedAt:d.data().savedAt}; });
-      }catch(e){ console.error('loadBackups error:',e); return []; }
+        await update(ref(rtdb), updates);
+        showSyncStatus('saved');
+      } catch(e){
+        console.error('DB update error:', e);
+        showSyncStatus('error');
+      }
     };
 
-    // 백업 복원
-    window.dbRestoreBackup = async function(backupId){
-      try{
-        const snap = await getDoc(doc(db,'backups',backupId));
-        if(!snap.exists()) return null;
-        return JSON.parse(snap.data().payload);
-      }catch(e){ console.error('restore error:',e); return null; }
-    };
-
-    // DB 불러오기
+    // ── 전체 로드
     window.dbLoad = async function(){
       try{
-        const snap = await getDoc(doc(db,'store','main'));
+        const snap = await get(ref(rtdb, 'data'));
         if(snap.exists()){
-          const data = JSON.parse(snap.data().payload);
           showSyncStatus('loaded');
-          return data;
+          return snap.val();
         }
         return null;
       } catch(e){
@@ -338,50 +324,74 @@ tr:hover td{background:var(--sf2)}
       }
     };
 
-    // 초기 로드
+    // ── 경로 단위 로드
+    window.dbGet = async function(path){
+      try{
+        const snap = await get(ref(rtdb, path));
+        return snap.exists() ? snap.val() : null;
+      } catch(e){ console.error('DB get error:', e); return null; }
+    };
+
+    // ── 백업 목록
+    window.dbLoadBackups = async function(){
+      try{
+        const snap = await get(ref(rtdb, 'backups'));
+        if(!snap.exists()) return [];
+        var list = [];
+        snap.forEach(function(child){
+          var v = child.val();
+          list.push({id: child.key, savedAt: v.savedAt});
+        });
+        return list.sort(function(a,b){return b.savedAt-a.savedAt;}).slice(0,20);
+      }catch(e){ console.error('loadBackups error:',e); return []; }
+    };
+
+    // ── 백업 복원
+    window.dbRestoreBackup = async function(backupId){
+      try{
+        const snap = await get(ref(rtdb, 'backups/' + backupId));
+        if(!snap.exists()) return null;
+        var v = snap.val();
+        return v.payload ? JSON.parse(v.payload) : null;
+      }catch(e){ console.error('restore error:',e); return null; }
+    };
+
+    // ── 초기 로드
     window.addEventListener('DOMContentLoaded', async ()=>{
       showSyncStatus('loading');
       const data = await window.dbLoad();
       if(data){
-        // Firestore 데이터를 S에 직접 반영 + localStorage 동기화
         try{
           S = data;
-          // S 필드 보정
           if(!S.advs)S.advs={};if(!S.tx)S.tx={};
-          // 택소노미 기본값 보정 (없는 키만 채움)
           if(typeof TXM!=='undefined'&&typeof TXD!=='undefined'){
             TXM.forEach(function(m){if(!S.tx[m.k])S.tx[m.k]=JSON.parse(JSON.stringify(TXD[m.k]));});
           }
           if(!S.gantt)S.gantt={};if(!S.done)S.done={};
           if(!S.cl)S.cl={};if(!S.sg)S.sg={};if(!S.mm)S.mm={};
-          localStorage.setItem('utm6', JSON.stringify(S));
-          // UI 갱신
-          // 기존 rows에 _id 없으면 자동 부여 (마이그레이션)
           migrateRowIds(S);
+          localStorage.setItem('utm6', JSON.stringify(S));
           if(typeof rNav==='function') rNav();
         }catch(e){ console.error('Data apply error:',e); if(typeof ld==='function') ld(); }
       } else {
-        // Firestore에 데이터 없음 → localStorage/SEED fallback
         if(typeof ld==='function') ld();
       }
       window._storage = getStorage(app);
       window._fbReady = true;
 
       // ── 실시간 동기화: 다른 사용자 변경 감지 ──
-      var _snapshotInit = true; // 최초 로드는 무시
-      onSnapshot(doc(db,'store','main'), function(snap){
-        if(_snapshotInit){ _snapshotInit=false; return; } // 초기 1회 skip
+      var _rtdbInitDone = false;
+      onValue(ref(rtdb, 'data'), function(snap){
+        if(!_rtdbInitDone){ _rtdbInitDone=true; return; } // 초기 1회 skip
         if(!snap.exists()) return;
-        // 내가 저장 중이면 무시 (500ms 이내)
         if(window._dbSaveTimer) return;
-        // 토스트 알림만 표시 (덮어쓰기 안 함)
         if(typeof showSyncToast === 'function') showSyncToast();
       });
 
     // ── Firebase Storage 파일 업로드 ──
     window.uploadFile = async function(file, path, onProgress){
       try{
-        var storageRef = ref(window._storage, path);
+        var storageRef = sRef(window._storage, path);
         var task = uploadBytesResumable(storageRef, file);
         return new Promise(function(resolve, reject){
           task.on('state_changed',
@@ -399,7 +409,7 @@ tr:hover td{background:var(--sf2)}
     // ── Firebase Storage 파일 삭제 ──
     window.deleteFile = async function(path){
       try{
-        var storageRef = ref(window._storage, path);
+        var storageRef = sRef(window._storage, path);
         await deleteObject(storageRef);
         return true;
       }catch(e){ console.error('Delete error:', e); return false; }
@@ -643,16 +653,12 @@ function migrateRowIds(state){
 
 async function runRowIdMigration(){
   if(!window._fbReady||!window.dbLoad||!window.dbSave){
-    alert('Firestore 연결 후 시도해주세요.');return;
+    alert('DB 연결 후 시도해주세요.');return;
   }
-  if(!confirm('미디어믹스 전체 행에 고유 ID를 부여합니다.\n이미 실행했다면 중복 실행 불필요합니다. 계속할까요?')) return;
-
+  if(!confirm('미디어믹스 전체 행에 고유 ID를 부여합니다.\n계속할까요?')) return;
   try{
-    // 1. Firestore 최신 데이터 로드
     var data = await window.dbLoad();
-    if(!data){ alert('Firestore 데이터 없음'); return; }
-
-    // 2. 전체 rows에 _id 부여
+    if(!data){ alert('DB 데이터 없음'); return; }
     var count = 0;
     if(data.mm){
       Object.keys(data.mm).forEach(function(k){
@@ -666,19 +672,11 @@ async function runRowIdMigration(){
         });
       });
     }
-
-    // 3. S에도 반영
+    data._rowIdMigrated = true;
     S = data;
     try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
-
-    // 4. Firestore 저장
     await window.dbSave(S);
-
-    // 5. 마이그레이션 완료 플래그 설정
-    S._rowIdMigrated = true;
-    await window.dbSave(S);
-
-    alert('마이그레이션 완료! ' + count + '개 행에 ID 부여됨.\n이제 동시 수정 충돌 감지가 활성화됩니다.');
+    alert('마이그레이션 완료! ' + count + '개 행에 ID 부여됨.');
     rNav();
   } catch(e){
     console.error('Migration error:', e);
@@ -694,27 +692,23 @@ function sv(){
   }
 }
 
-// ── 병합 저장 ──
+// ── 병합 저장 (Realtime DB update 방식) ──
 async function svMerge(){
-  if(!window._fbReady||!window.dbLoad||!window.dbSave) return;
+  if(!window._fbReady||!window.dbUpdate) return;
   try{
-    var remote = await window.dbLoad();
-    if(!remote){
-      await window.dbSave(S);
-      return;
-    }
-    var merged = mergeState(remote, S);
-    if(merged._conflicts && merged._conflicts.length > 0){
-      showConflictUI(merged._conflicts, merged);
-      return;
-    }
-    delete merged._conflicts;
-    S = merged;
-    try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
-    await window.dbSave(S);
+    // mm, advs, tx, gantt, done 경로 단위 update
+    var updates = {};
+    updates['data/advs'] = S.advs||{};
+    updates['data/tx'] = S.tx||{};
+    updates['data/gantt'] = S.gantt||{};
+    updates['data/done'] = S.done||{};
+    updates['data/mm'] = S.mm||{};
+    if(S._rowIdMigrated) updates['data/_rowIdMigrated'] = true;
+    await window.dbUpdate(updates);
   } catch(e){
     console.error('svMerge error:', e);
-    await window.dbSave(S);
+    // 실패 시 전체 저장
+    if(window.dbSave) await window.dbSave(S);
   }
 }
 
@@ -2015,33 +2009,21 @@ function svCl(key){
 }
 
 async function svClMerge(key){
-  if(!window._fbReady||!window.dbLoad||!window.dbSave) return;
+  if(!window._fbReady||!window.dbUpdate) return;
   try{
-    var remote = await window.dbLoad();
-    if(!remote){ await window.dbSave(S); return; }
-    // cl/sg 해당 키만 로컬 우선으로 병합
-    if(!remote.cl) remote.cl={};
-    remote.cl[key] = S.cl[key];
-    // sg도 같은 키 prefix면 병합
+    var updates = {};
+    // cl 해당 키만 update
+    updates['data/cl/' + key] = S.cl[key]||{};
+    // sg 해당 키 prefix 업데이트
     if(S.sg){
-      if(!remote.sg) remote.sg={};
       Object.keys(S.sg).forEach(function(k){
-        if(k.indexOf(key)===0) remote.sg[k]=S.sg[k];
+        if(k.indexOf(key)===0) updates['data/sg/' + k] = S.sg[k];
       });
     }
-    // mm은 로컬 완전 우선
-    if(S.mm) remote.mm = JSON.parse(JSON.stringify(S.mm));
-    // 나머지도 로컬 우선
-    if(S.advs) remote.advs = S.advs;
-    if(S.tx) remote.tx = S.tx;
-    if(S.gantt) remote.gantt = S.gantt;
-    if(S.done) remote.done = S.done;
-    S = remote;
-    try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
-    await window.dbSave(S);
+    await window.dbUpdate(updates);
   } catch(e){
     console.error('svClMerge error:', e);
-    await window.dbSave(S);
+    if(window.dbSave) await window.dbSave(S);
   }
 }
 
