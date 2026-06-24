@@ -550,6 +550,12 @@ tr:hover td{background:var(--sf2)}
         <div style="font-size:11px;color:#4a5264;margin-bottom:10px">5분마다 자동 저장된 백업에서 이전 시점으로 복원합니다. 최근 20개 보관.</div>
         <button onclick="showBackupList()" style="font-size:12px;padding:7px 16px;border-radius:6px;border:none;background:#7c3aed;color:#fff;cursor:pointer;font-weight:500">🗂 백업 목록 보기</button>
       </div>
+      <!-- Row ID 마이그레이션 -->
+      <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:14px;margin-bottom:12px">
+        <div style="font-size:12px;font-weight:700;color:#c2410c;margin-bottom:6px">🔧 미디어믹스 Row ID 마이그레이션</div>
+        <div style="font-size:11px;color:#4a5264;margin-bottom:10px">최초 1회 실행. 기존 미디어믹스 행에 고유 ID를 부여합니다. 실행 후 동시 수정 충돌 감지가 활성화됩니다.</div>
+        <button onclick="runRowIdMigration()" style="font-size:12px;padding:7px 16px;border-radius:6px;border:none;background:#c2410c;color:#fff;cursor:pointer;font-weight:500">🔧 마이그레이션 실행</button>
+      </div>
       <!-- 불러오기 -->
       <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:14px;margin-bottom:12px">
         <div style="font-size:12px;font-weight:700;color:#1d4ed8;margin-bottom:6px">📥 데이터 불러오기 (JSON 복원)</div>
@@ -635,6 +641,51 @@ function migrateRowIds(state){
   });
 }
 
+async function runRowIdMigration(){
+  if(!window._fbReady||!window.dbLoad||!window.dbSave){
+    alert('Firestore 연결 후 시도해주세요.');return;
+  }
+  if(!confirm('미디어믹스 전체 행에 고유 ID를 부여합니다.\n이미 실행했다면 중복 실행 불필요합니다. 계속할까요?')) return;
+
+  try{
+    // 1. Firestore 최신 데이터 로드
+    var data = await window.dbLoad();
+    if(!data){ alert('Firestore 데이터 없음'); return; }
+
+    // 2. 전체 rows에 _id 부여
+    var count = 0;
+    if(data.mm){
+      Object.keys(data.mm).forEach(function(k){
+        var d=data.mm[k];
+        if(!d||!d.mixes) return;
+        d.mixes.forEach(function(mix){
+          if(!mix.rows) return;
+          mix.rows.forEach(function(r){
+            if(!r._id){ r._id=uid(); r._updatedAt=Date.now(); count++; }
+          });
+        });
+      });
+    }
+
+    // 3. S에도 반영
+    S = data;
+    try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+
+    // 4. Firestore 저장
+    await window.dbSave(S);
+
+    // 5. 마이그레이션 완료 플래그 설정
+    S._rowIdMigrated = true;
+    await window.dbSave(S);
+
+    alert('마이그레이션 완료! ' + count + '개 행에 ID 부여됨.\n이제 동시 수정 충돌 감지가 활성화됩니다.');
+    rNav();
+  } catch(e){
+    console.error('Migration error:', e);
+    alert('마이그레이션 실패: ' + e.message);
+  }
+}
+
 function sv(){
   try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
   if(window._fbReady){
@@ -649,12 +700,10 @@ async function svMerge(){
   try{
     var remote = await window.dbLoad();
     if(!remote){
-      // Firestore에 데이터 없으면 그냥 저장
       await window.dbSave(S);
       return;
     }
     var merged = mergeState(remote, S);
-    // 충돌 행 있으면 사용자에게 물어봄
     if(merged._conflicts && merged._conflicts.length > 0){
       showConflictUI(merged._conflicts, merged);
       return;
@@ -665,7 +714,6 @@ async function svMerge(){
     await window.dbSave(S);
   } catch(e){
     console.error('svMerge error:', e);
-    // 실패 시 기존 방식으로 저장
     await window.dbSave(S);
   }
 }
@@ -711,30 +759,57 @@ function mergeState(remote, local){
   if(local.advs) merged.advs = local.advs;
   if(local.done) merged.done = local.done;
 
-  // 6. 미디어믹스 — 로컬 완전 우선 + remote에만 있는 신규 믹스만 추가
+  // 6. 미디어믹스
   if(local.mm){
-    if(!merged.mm) merged.mm={};
-    Object.keys(local.mm).forEach(function(projKey){
-      var localMM = local.mm[projKey];
-      var remoteMM = merged.mm[projKey];
-      if(!remoteMM){
-        merged.mm[projKey] = localMM;
-        return;
-      }
-      // 로컬 기준으로 시작
-      var mergedMM = JSON.parse(JSON.stringify(localMM));
+    // 마이그레이션 완료된 경우 Row ID 기반 병합, 아니면 로컬 완전 우선
+    if(local._rowIdMigrated && remote._rowIdMigrated){
+      if(!merged.mm) merged.mm={};
+      Object.keys(local.mm).forEach(function(projKey){
+        var localMM = local.mm[projKey];
+        var remoteMM = merged.mm[projKey];
+        if(!remoteMM){ merged.mm[projKey] = localMM; return; }
 
-      // remote에만 있는 믹스(다른 사람이 새로 만든 것)만 추가
-      var localMixIds = (localMM.mixes||[]).map(function(m){return m.id;});
-      (remoteMM.mixes||[]).forEach(function(rMix){
-        if(localMixIds.indexOf(rMix.id) === -1){
-          // 로컬에 없는 믹스 → 다른 사람이 만든 것, 추가
-          mergedMM.mixes.push(rMix);
-        }
+        var mergedMM = JSON.parse(JSON.stringify(localMM));
+        // remote에만 있는 믹스(다른 사람 신규 생성)만 추가
+        var localMixIds = (localMM.mixes||[]).map(function(m){return m.id;});
+        (remoteMM.mixes||[]).forEach(function(rMix){
+          if(localMixIds.indexOf(rMix.id)===-1) mergedMM.mixes.push(rMix);
+        });
+
+        // 같은 믹스 내 rows - Row ID 기반 병합
+        (localMM.mixes||[]).forEach(function(lMix){
+          var mergedMix = mergedMM.mixes.find(function(m){return m.id===lMix.id;});
+          var rMix = (remoteMM.mixes||[]).find(function(m){return m.id===lMix.id;});
+          if(!mergedMix||!rMix) return;
+
+          var lRows = lMix.rows||[];
+          var rRows = rMix.rows||[];
+          var mergedRows = JSON.parse(JSON.stringify(lRows)); // 로컬 기준
+
+          // remote에만 있는 신규 행 추가
+          var lIds = lRows.map(function(r){return r._id;});
+          rRows.forEach(function(rRow){
+            if(lIds.indexOf(rRow._id)===-1){
+              // 로컬에 없는 행 → 다른 사람이 추가한 것
+              mergedRows.push(rRow);
+            } else {
+              // 같은 행 — updatedAt 비교
+              var lRow = lRows.find(function(r){return r._id===rRow._id;});
+              if(lRow && rRow._updatedAt > (lRow._updatedAt||0)){
+                // remote가 더 최근 → 충돌 기록
+                conflicts.push({type:'row', mixId:lMix.id, mixName:lMix.name, local:lRow, remote:rRow});
+              }
+            }
+          });
+          mergedMix.rows = mergedRows;
+        });
+
+        merged.mm[projKey] = mergedMM;
       });
-
-      merged.mm[projKey] = mergedMM;
-    });
+    } else {
+      // 마이그레이션 미완료 → 로컬 완전 우선
+      merged.mm = JSON.parse(JSON.stringify(local.mm));
+    }
   }
 
   merged._conflicts = conflicts;
@@ -1610,7 +1685,7 @@ function saveClMeta(key,field,val){
   if(!S.cl[key])S.cl[key]={fields:{},done:{},meta:{}};
   if(!S.cl[key].meta)S.cl[key].meta={};
   S.cl[key].meta[field]=val;
-  sv();
+  svCl(key);
 }
 function metaBlock(key, label, color){
   const item=getClItem(key);
@@ -1918,17 +1993,56 @@ function saveClField(key,field,val){
   if(!S.cl)S.cl={};
   if(!S.cl[key])S.cl[key]={fields:{},done:{}};
   S.cl[key].fields[field]=val;
-  sv();
+  svCl(key);
 }
 
 function toggleClField(key,field,val){
   if(!S.cl)S.cl={};
   if(!S.cl[key])S.cl[key]={fields:{},done:{}};
   S.cl[key].done[field]=val;
-  sv();
-  // 부모 영역 진행률 갱신
+  svCl(key);
   if(cTab==='ck'){const ck=document.getElementById('ck-pane');if(ck)rChecklist(ck);}
   if(cTab==='dh'){const dh=document.getElementById('dh-pane');if(dh)rDashboard(dh);}
+}
+
+// 키 단위 debounce 저장 (세팅 체크리스트/가이드)
+var _svClTimers={};
+function svCl(key){
+  try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+  if(!window._fbReady) return;
+  clearTimeout(_svClTimers[key]);
+  _svClTimers[key]=setTimeout(function(){ svClMerge(key); }, 600);
+}
+
+async function svClMerge(key){
+  if(!window._fbReady||!window.dbLoad||!window.dbSave) return;
+  try{
+    var remote = await window.dbLoad();
+    if(!remote){ await window.dbSave(S); return; }
+    // cl/sg 해당 키만 로컬 우선으로 병합
+    if(!remote.cl) remote.cl={};
+    remote.cl[key] = S.cl[key];
+    // sg도 같은 키 prefix면 병합
+    if(S.sg){
+      if(!remote.sg) remote.sg={};
+      Object.keys(S.sg).forEach(function(k){
+        if(k.indexOf(key)===0) remote.sg[k]=S.sg[k];
+      });
+    }
+    // mm은 로컬 완전 우선
+    if(S.mm) remote.mm = JSON.parse(JSON.stringify(S.mm));
+    // 나머지도 로컬 우선
+    if(S.advs) remote.advs = S.advs;
+    if(S.tx) remote.tx = S.tx;
+    if(S.gantt) remote.gantt = S.gantt;
+    if(S.done) remote.done = S.done;
+    S = remote;
+    try{localStorage.setItem(SK,JSON.stringify(S));}catch(e){}
+    await window.dbSave(S);
+  } catch(e){
+    console.error('svClMerge error:', e);
+    await window.dbSave(S);
+  }
 }
 
 // ══════════════════════════════════════════════════════
